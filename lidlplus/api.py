@@ -5,6 +5,7 @@ Lidl Plus api
 import base64
 import html
 import logging
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -188,12 +189,50 @@ class LidlPlusApi:
     def _collect_page_errors(browser):
         """Grab any visible error messages from the login page for better error reporting"""
         errors = []
-        selectors = ['[id$="-error"]', ".input-error-message", '[class*="error-message"]']
+        selectors = [
+            '[id$="-error"]',
+            ".input-error-message",
+            '[class*="error-message"]',
+            '[role="alert"]',
+            '[data-testid*="error"]',
+        ]
         for selector in selectors:
             for element in browser.find_elements(By.CSS_SELECTOR, selector):
-                if text := element.text.strip():
+                if (text := element.text.strip()) and text not in errors:
                     errors.append(text)
         return errors
+
+    @staticmethod
+    def _save_login_debug(browser):
+        """
+        Save a screenshot and the server responses of the login submission,
+        so a failed login can be analyzed. Files are written to the current directory.
+        """
+        debug_files = []
+        # pylint: disable=broad-except
+        try:
+            path = os.path.abspath("lidl-plus-login-debug.png")
+            browser.save_screenshot(path)
+            debug_files.append(path)
+        except Exception as error:
+            logging.debug("Could not save debug screenshot: %s", error)
+        try:
+            parts = [f"<!-- current url: {browser.current_url} -->", browser.page_source]
+            for request in browser.requests:
+                if "/Account/Login" in request.url and request.method == "POST" and request.response:
+                    encoding = request.response.headers.get("Content-Encoding", "identity")
+                    body = decode(request.response.body, encoding).decode(errors="replace")
+                    status = request.response.status_code
+                    location = request.response.headers.get("Location", "")
+                    parts.append(f"<!-- POST {request.url} -> {status} location={location} -->")
+                    parts.append(body)
+            path = os.path.abspath("lidl-plus-login-debug.html")
+            with open(path, "w", encoding="utf-8") as file:
+                file.write("\n".join(parts))
+            debug_files.append(path)
+        except Exception as error:
+            logging.debug("Could not save debug page source: %s", error)
+        return debug_files
 
     def _parse_code_once(self, browser, accept_legal_terms=True):
         candidate_urls = [browser.current_url]
@@ -227,6 +266,14 @@ class LidlPlusApi:
         else:
             current = urlparse(browser.current_url)
             message += f" - login never reached the callback (stuck on {current.netloc}{current.path})"
+            # pylint: disable=broad-except
+            try:
+                page_text = " ".join(browser.find_element(By.TAG_NAME, "body").text.split())
+                message += f' - the page shows: "{page_text[:300]}"'
+            except Exception as error:
+                logging.debug("Could not read page text: %s", error)
+        if debug_files := self._save_login_debug(browser):
+            message += f" - debug files saved: {', '.join(debug_files)}"
         raise LoginError(message)
 
     def _check_login_error(self, browser):
@@ -325,15 +372,18 @@ class LidlPlusApi:
         del browser.requests
         self._submit_form_step(browser, fallback_field=password_field)
         self._check_login_error(browser)
-        self._check_2fa_auth(
-            browser,
-            kwargs.get("verify_mode", "phone"),
-            kwargs.get("verify_token_func"),
-        )
+        verify_mode = kwargs.get("verify_mode", "phone")
+        verify_token_func = kwargs.get("verify_token_func")
+        self._check_2fa_auth(browser, verify_mode, verify_token_func)
         try:
-            browser.wait_for_request(f"{self._AUTH_API}/connect/authorize/callback", 30)
+            browser.wait_for_request(f"{self._AUTH_API}/connect/authorize/callback", 20)
         except TimeoutException:
-            pass  # _parse_code polls and reports what went wrong
+            # the verification code page may have appeared after the first check
+            self._check_2fa_auth(browser, verify_mode, verify_token_func)
+            try:
+                browser.wait_for_request(f"{self._AUTH_API}/connect/authorize/callback", 15)
+            except TimeoutException:
+                pass  # _parse_code polls and reports what went wrong
         code = self._parse_code(browser, accept_legal_terms=kwargs.get("accept_legal_terms", True))
         self._authorization_code(code)
         browser.quit()
