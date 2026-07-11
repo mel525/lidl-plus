@@ -4,6 +4,7 @@ Lidl Plus api
 
 import base64
 import html
+import json
 import logging
 import os
 import re
@@ -268,6 +269,8 @@ class LidlPlusApi:
             message += f" - login never reached the callback (stuck on {current.netloc}{current.path})"
             # pylint: disable=broad-except
             try:
+                if app := browser.find_elements(By.ID, "app"):
+                    message += f" at step {app[0].get_attribute('app-location')!r}"
                 page_text = " ".join(browser.find_element(By.TAG_NAME, "body").text.split())
                 message += f' - the page shows: "{page_text[:300]}"'
             except Exception as error:
@@ -275,6 +278,18 @@ class LidlPlusApi:
         if debug_files := self._save_login_debug(browser):
             message += f" - debug files saved: {', '.join(debug_files)}"
         raise LoginError(message)
+
+    @staticmethod
+    def _parse_app_errors(body):
+        """Read the app-errors attribute the login page uses to pass server errors to the frontend"""
+        for quote in ("'", '"'):
+            if match := re.search(f"app-errors={quote}([^{quote}]*){quote}", body):
+                try:
+                    if errors := json.loads(match.group(1) or "{}"):
+                        return [str(value) for value in errors.values()]
+                except json.JSONDecodeError:
+                    continue
+        return []
 
     def _check_login_error(self, browser):
         try:
@@ -284,31 +299,44 @@ class LidlPlusApi:
         if response is None:
             return
         body = html.unescape(decode(response.body, response.headers.get("Content-Encoding", "identity")).decode())
-        if error := re.findall('app-errors="\\{[^:]*?:.(.*?).}', body):
-            raise LoginError(error[0])
+        if errors := self._parse_app_errors(body):
+            raise LoginError(" / ".join(errors))
         if errors := self._collect_page_errors(browser):
             raise LoginError(" / ".join(errors))
 
+    _MFA_SEND_BUTTONS = {
+        "email": '#sso_2FAvalidation_emailbutton, [data-testid="forgot-password-by-email-button"]',
+        "phone": '#sso_2FAvalidation_smsbutton, [data-testid="forgot-password-by-phone-button"]',
+    }
+    _MFA_CODE_INPUT = '[data-testid="input-verification-code"], input[autocomplete="one-time-code"]'
+
     def _check_2fa_auth(self, browser, verify_mode="phone", verify_token_func=None):
         """
-        Lidl asks for a one time verification code when it does not know the device.
-        Wait a moment for the code input to appear - if it does not, no code is needed.
+        Lidl verifies unknown devices with a one time code. After the password a chooser
+        appears ("Sicherheitsvalidierung") to receive the code via email or sms, then the
+        code input itself. If neither shows up, no verification is needed.
         """
         if verify_mode not in ["phone", "email"]:
             raise ValueError(f'Unknown 2fa-mode "{verify_mode}" - Only "phone" or "email" supported')
+        chooser_or_input = (
+            f"{self._MFA_SEND_BUTTONS['email']}, {self._MFA_SEND_BUTTONS['phone']}, {self._MFA_CODE_INPUT}"
+        )
         try:
-            code_input = WebDriverWait(browser, 8).until(
-                expected_conditions.visibility_of_element_located(
-                    (
-                        By.CSS_SELECTOR,
-                        '[data-testid="input-verification-code"], input[autocomplete="one-time-code"]',
-                    )
-                )
+            WebDriverWait(browser, 10).until(
+                expected_conditions.visibility_of_element_located((By.CSS_SELECTOR, chooser_or_input))
             )
         except TimeoutException:
             return
         if verify_token_func is None:
             raise LoginError("A verification code is required but no verify_token_func was provided")
+        other_mode = "email" if verify_mode == "phone" else "phone"
+        for mode in (verify_mode, other_mode):
+            if buttons := browser.find_elements(By.CSS_SELECTOR, self._MFA_SEND_BUTTONS[mode]):
+                buttons[0].click()
+                break
+        code_input = WebDriverWait(browser, 15).until(
+            expected_conditions.visibility_of_element_located((By.CSS_SELECTOR, self._MFA_CODE_INPUT))
+        )
         verify_code = verify_token_func()
         code_input.send_keys(verify_code)
         self._submit_form_step(browser, fallback_field=code_input)
