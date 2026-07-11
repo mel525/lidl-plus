@@ -11,7 +11,7 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="lidl-plus",
-    version="0.3.5",
+    version="0.4.0",
     author="Andre Basche",
     description="Fetch receipts and more from Lidl Plus",
     long_description=long_description,
@@ -47,6 +47,9 @@ setup(
             "oic>=1.4.0",
             "selenium-wire>=5.1.0",
             "webdriver-manager>=3.8.5",
+            "blinker==1.7.0",
+            "pyOpenSSL<26.0.0",
+            "setuptools<81",
         ]
     },
     entry_points={

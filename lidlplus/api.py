@@ -6,7 +6,8 @@ import base64
 import html
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
@@ -21,8 +22,10 @@ try:
     from getuseragent import UserAgent
     from oic.oic import Client
     from oic.utils.authn.client import CLIENT_AUTHN_METHOD
+    from selenium.common.exceptions import TimeoutException
     from selenium.webdriver.chrome.service import Service
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support import expected_conditions
     from selenium.webdriver.support.ui import WebDriverWait
     from seleniumwire import webdriver
@@ -30,8 +33,8 @@ try:
     from webdriver_manager.chrome import ChromeDriverManager
     from webdriver_manager.firefox import GeckoDriverManager
     from webdriver_manager.core.os_manager import ChromeType
-except ImportError:
-    pass
+except ImportError as import_error:
+    logging.debug("Auth dependencies not installed: %s", import_error)
 
 
 class LidlPlusApi:
@@ -40,8 +43,8 @@ class LidlPlusApi:
     _CLIENT_ID = "LidlPlusNativeClient"
     _AUTH_API = "https://accounts.lidl.com"
     _TICKET_API = "https://tickets.lidlplus.com/api/v2"
-    _COUPONS_API = "https://coupons.lidlplus.com/api"
-    _COUPONS_V1_API = "https://coupons.lidlplus.com/app/api/"
+    _TICKET_API_V3 = "https://tickets.lidlplus.com/api/v3"
+    _COUPONS_API = "https://coupons.lidlplus.com/app/api"
     _PROFILE_API = "https://profile.lidlplus.com/profile/api"
     _APP = "com.lidlplus.app"
     _OS = "iOs"
@@ -103,15 +106,9 @@ class LidlPlusApi:
         logging.getLogger("WDM").setLevel(logging.NOTSET)
         options = webdriver.FirefoxOptions()
         if headless:
-            options.headless = True
-        profile = webdriver.FirefoxProfile()
-        profile.set_preference("general.useragent.override", user_agent)
-        return webdriver.Firefox(
-            executable_path=GeckoDriverManager().install(),
-            firefox_binary="/usr/bin/firefox",
-            options=options,
-            firefox_profile=profile,
-        )
+            options.add_argument("-headless")
+        options.set_preference("general.useragent.override", user_agent)
+        return webdriver.Firefox(options=options)
 
     def _get_browser(self, headless=True):
         try:
@@ -131,7 +128,9 @@ class LidlPlusApi:
         }
         kwargs = {"headers": headers, "data": payload, "timeout": self._TIMEOUT}
         response = requests.post(f"{self._AUTH_API}/connect/token", **kwargs).json()
-        self._expires = datetime.utcnow() + timedelta(seconds=response["expires_in"])
+        if "error" in response:
+            raise LoginError(f"Token request failed: {response.get('error')}")
+        self._expires = datetime.now(timezone.utc) + timedelta(seconds=response["expires_in"])
         self._token = response["access_token"]
         self._refresh_token = response["refresh_token"]
 
@@ -165,17 +164,32 @@ class LidlPlusApi:
             raise LegalTermsException(title)
         browser.find_element(By.TAG_NAME, "button").click()
 
+    @staticmethod
+    def _extract_code_from_url(url):
+        """Extract the OAuth authorization code from a callback url"""
+        if not url or "code" not in url:
+            return ""
+        for candidate in (url, unquote(url)):
+            if code := parse_qs(urlparse(candidate).query).get("code"):
+                return code[0]
+        if code := re.findall("[?&]code=([0-9A-Fa-f-]+)", unquote(url)):
+            return code[0]
+        return ""
+
     def _parse_code(self, browser, wait, accept_legal_terms=True):
+        candidate_urls = [browser.current_url]
         for request in reversed(browser.requests):
-            if f"{self._AUTH_API}/connect" not in request.url:
-                continue
-            location = request.response.headers.get("Location", "")
-            if "legalTerms" in location:
+            candidate_urls.append(request.url)
+            if request.response:
+                candidate_urls.append(request.response.headers.get("Location") or "")
+
+        for candidate_url in candidate_urls:
+            if "legalTerms" in candidate_url:
                 self._accept_legal_terms(browser, wait, accept=accept_legal_terms)
                 return self._parse_code(browser, wait, False)
-            if code := re.findall("code=([0-9A-F]+)", location):
-                return code[0]
-        return ""
+            if code := self._extract_code_from_url(candidate_url):
+                return code
+        raise LoginError("Unable to parse authorization code from login redirect")
 
     def _click(self, browser, button, request=""):
         del browser.requests
@@ -194,6 +208,8 @@ class LidlPlusApi:
 
     def _check_login_error(self, browser):
         response = browser.wait_for_request(f"{self._AUTH_API}/Account/Login.*", 10).response
+        if response is None:
+            return
         body = html.unescape(decode(response.body, response.headers.get("Content-Encoding", "identity")).decode())
         if error := re.findall('app-errors="\\{[^:]*?:.(.*?).}', body):
             raise LoginError(error[0])
@@ -201,29 +217,71 @@ class LidlPlusApi:
     def _check_2fa_auth(self, browser, wait, verify_mode="phone", verify_token_func=None):
         if verify_mode not in ["phone", "email"]:
             raise ValueError(f'Unknown 2fa-mode "{verify_mode}" - Only "phone" or "email" supported')
-        response = browser.wait_for_request(f"{self._AUTH_API}/Account/Login.*", 10).response
-        if "/connect/authorize/callback" not in response.headers.get("Location"):
-            element = wait.until(expected_conditions.visibility_of_element_located((By.CLASS_NAME, verify_mode)))
-            element.find_element(By.TAG_NAME, "button").click()
-            verify_code = verify_token_func()
-            browser.find_element(By.NAME, "VerificationCode").send_keys(verify_code)
-            self._click(browser, (By.CLASS_NAME, "role_next"))
+        try:
+            element = WebDriverWait(browser, 5).until(
+                expected_conditions.visibility_of_element_located((By.CLASS_NAME, verify_mode))
+            )
+        except TimeoutException:
+            return
+        element.find_element(By.TAG_NAME, "button").click()
+        if verify_token_func is None:
+            raise LoginError("Two factor authentication required but no verify_token_func provided")
+        verify_code = verify_token_func()
+        browser.find_element(By.NAME, "VerificationCode").send_keys(verify_code)
+        self._click(browser, (By.CLASS_NAME, "role_next"))
 
-    def login(self, phone, password, **kwargs):
-        """Simulate app auth"""
+    @staticmethod
+    def _accept_cookies(browser):
+        """Dismiss the cookie consent banner if it shows up, it can block clicks"""
+        try:
+            WebDriverWait(browser, 3).until(
+                expected_conditions.element_to_be_clickable((By.ID, "cookie-consent-accept"))
+            ).click()
+        except TimeoutException:
+            pass
+
+    @staticmethod
+    def _submit_password(browser, password_field):
+        """Click the password submit button, falling back to pressing enter in the password field"""
+        locators = [
+            (By.XPATH, "/html/body/main/form[1]/div/div/div/div/section/button"),
+            (By.CSS_SELECTOR, 'section[data-testid$="step-view"] button:last-of-type'),
+        ]
+        for locator in locators:
+            try:
+                WebDriverWait(browser, 3).until(expected_conditions.element_to_be_clickable(locator)).click()
+                return
+            except TimeoutException:
+                continue
+        password_field.send_keys(Keys.RETURN)
+
+    def login(self, username, password, method="email", **kwargs):
+        """
+        Simulate app auth.
+
+        :param username: email address or phone number (with country prefix) of your account
+        :param password: password of your account
+        :param method: "email" or "phone" - which kind of username to log in with
+        """
         browser = self._get_browser(headless=kwargs.get("headless", True))
         browser.get(self._register_link)
-        wait = WebDriverWait(browser, 10)
-        wait.until(expected_conditions.visibility_of_element_located((By.ID, "button_welcome_login"))).click()
-        wait.until(expected_conditions.visibility_of_element_located((By.NAME, "EmailOrPhone"))).send_keys(phone)
-        self._click(browser, (By.ID, "button_btn_submit_email"))
-        self._click(
-            browser,
-            (By.ID, "button_btn_submit_email"),
-            request=f"{self._AUTH_API}/api/phone/exists.*",
-        )
-        wait.until(expected_conditions.element_to_be_clickable((By.ID, "field_Password"))).send_keys(password)
-        self._click(browser, (By.ID, "button_submit"))
+        wait = WebDriverWait(browser, 15)
+        self._accept_cookies(browser)
+        if str(method).lower().startswith("p"):
+            wait.until(
+                expected_conditions.element_to_be_clickable((By.CSS_SELECTOR, '[data-testid="switch-method-button"]'))
+            ).click()
+            wait.until(expected_conditions.element_to_be_clickable((By.NAME, "input-phone"))).send_keys(username)
+        else:
+            wait.until(expected_conditions.element_to_be_clickable((By.NAME, "input-email"))).send_keys(username)
+        wait.until(
+            expected_conditions.element_to_be_clickable(
+                (By.CSS_SELECTOR, '[data-testid="login-or-register-submit-button"]')
+            )
+        ).click()
+        password_field = wait.until(expected_conditions.element_to_be_clickable((By.NAME, "Password")))
+        password_field.send_keys(password)
+        self._submit_password(browser, password_field)
         self._check_login_error(browser)
         self._check_2fa_auth(
             browser,
@@ -234,9 +292,11 @@ class LidlPlusApi:
         browser.wait_for_request(f"{self._AUTH_API}/connect.*")
         code = self._parse_code(browser, wait, accept_legal_terms=kwargs.get("accept_legal_terms", True))
         self._authorization_code(code)
+        browser.quit()
 
     def _default_headers(self):
-        if (not self._token and self._refresh_token) or datetime.utcnow() >= self._expires:
+        token_expired = self._expires and datetime.now(timezone.utc) >= self._expires
+        if self._refresh_token and (not self._token or token_expired):
             self._renew_token()
         if not self._token:
             raise MissingLogin("You need to login!")
@@ -266,43 +326,56 @@ class LidlPlusApi:
         return tickets
 
     def ticket(self, ticket_id):
-        """Get full data of single ticket by id"""
+        """
+        Get full data of single ticket by id.
+
+        Lidl removed the v2 endpoint for single tickets - the v3 response contains the
+        receipt as rendered html in the "htmlPrintedReceipt" field instead of itemized json.
+        """
         kwargs = {"headers": self._default_headers(), "timeout": self._TIMEOUT}
-        url = f"{self._TICKET_API}/{self._country}/tickets"
+        url = f"{self._TICKET_API_V3}/{self._country}/tickets"
         return requests.get(f"{url}/{ticket_id}", **kwargs).json()
+
+    def _coupons_headers(self):
+        return {**self._default_headers(), "Country": self._country}
 
     def coupon_promotions_v1(self):
         """Get list of all coupons API V1"""
-        url = f"{self._COUPONS_V1_API}/v1/promotionslist"
-        kwargs = {"headers": {**self._default_headers(), "Country": self._country}, "timeout": self._TIMEOUT}
+        url = f"{self._COUPONS_API}/v1/promotionslist"
+        kwargs = {"headers": self._coupons_headers(), "timeout": self._TIMEOUT}
         return requests.get(url, **kwargs).json()
 
     def activate_coupon_promotion_v1(self, promotion_id):
         """Activate single coupon by id API V1"""
-        url = f"{self._COUPONS_V1_API}/v1/promotions/{promotion_id}/activation"
-        kwargs = {"headers": {**self._default_headers(), "Country": self._country}, "timeout": self._TIMEOUT}
-        return requests.post(url, **kwargs)
+        url = f"{self._COUPONS_API}/v1/promotions/{promotion_id}/activation"
+        kwargs = {"headers": self._coupons_headers(), "timeout": self._TIMEOUT}
+        return requests.post(url, **kwargs).text
 
     def coupons(self):
         """Get list of all coupons"""
-        url = f"{self._COUPONS_API}/v2/{self._country}"
-        kwargs = {"headers": self._default_headers(), "timeout": self._TIMEOUT}
+        url = f"{self._COUPONS_API}/v2/promotionsList"
+        kwargs = {"headers": self._coupons_headers(), "timeout": self._TIMEOUT}
         return requests.get(url, **kwargs).json()
 
     def activate_coupon(self, coupon_id):
         """Activate single coupon by id"""
-        url = f"{self._COUPONS_API}/v1/{self._country}/{coupon_id}/activation"
-        kwargs = {"headers": self._default_headers(), "timeout": self._TIMEOUT}
-        return requests.post(url, **kwargs).json()
+        url = f"{self._COUPONS_API}/v1/promotions/{coupon_id}/activation"
+        kwargs = {"headers": self._coupons_headers(), "timeout": self._TIMEOUT}
+        return requests.post(url, **kwargs).text
 
     def deactivate_coupon(self, coupon_id):
         """Deactivate single coupon by id"""
-        url = f"{self._COUPONS_API}/v1/{self._country}/{coupon_id}/activation"
-        kwargs = {"headers": self._default_headers(), "timeout": self._TIMEOUT}
-        return requests.delete(url, **kwargs).json()
+        url = f"{self._COUPONS_API}/v1/promotions/{coupon_id}/activation"
+        kwargs = {"headers": self._coupons_headers(), "timeout": self._TIMEOUT}
+        return requests.delete(url, **kwargs).text
 
     def loyalty_id(self):
-        """Get your loyalty ID"""
+        """
+        Get your loyalty ID.
+
+        Warning: Lidl removed this endpoint (it currently returns 404),
+        kept here in case it comes back under the same path.
+        """
         url = f"{self._PROFILE_API}/v1/{self._country}/loyalty"
         kwargs = {"headers": self._default_headers(), "timeout": self._TIMEOUT}
         response = requests.get(url, **kwargs)

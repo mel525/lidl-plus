@@ -1,5 +1,17 @@
 **This python package is unofficial and is not related in any way to Lidl. It was developed by reversed engineered requests and can stop working at anytime!**
 
+> **Note:** This is a fork of [Andre0512/lidl-plus](https://github.com/Andre0512/lidl-plus) with fixes for Lidl's API changes (July 2026):
+> - new login page (email or phone number + new selectors)
+> - coupons moved to `coupons.lidlplus.com/app/api/v2/promotionsList`
+> - single receipts moved to the v3 ticket API (receipt content is now html in `htmlPrintedReceipt`)
+> - dependency pins so `selenium-wire` still works (`blinker`, `pyOpenSSL`, `setuptools`)
+>
+> The `loyalty_id` endpoint was removed by Lidl and currently returns 404.
+> Install from this repo, the version on PyPI is outdated:
+> ```bash
+> pip install "lidl-plus[auth] @ git+https://github.com/mel525/lidl-plus"
+> ```
+
 # Python Lidl Plus API
 [![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/Andre0512/lidl-plus/python-check.yml?branch=main&label=checks)](https://github.com/Andre0512/lidl-plus/actions/workflows/python-check.yml)
 [![PyPI - Status](https://img.shields.io/pypi/status/lidl-plus)](https://pypi.org/project/lidl-plus)
@@ -36,7 +48,8 @@ After we have received the token once, we can use it for further requestes and w
 $ lidl-plus auth
 Enter your language (de, en, ...): de
 Enter your country (DE, AT, ...): AT
-Enter your lidl plus username (phone number): +4915784632296
+Login with [e]mail or [p]hone number?: p
+Enter your lidl plus phone number (+4912345...): +4915784632296
 Enter your lidl plus password:
 Enter the verify code you received via phone: 590287
 ------------------------- refresh token ------------------------
@@ -49,9 +62,10 @@ Enter the verify code you received via phone: 590287
 from lidlplus import LidlPlusApi
 
 lidl = LidlPlusApi(language="de", country="AT")
-lidl.login(phone="+4915784632296", password="password", verify_token_func=lambda: input("Insert code: "))
+lidl.login("+4915784632296", "password", method="phone", verify_token_func=lambda: input("Insert code: "))
 print(lidl.refresh_token)
 ```
+Use `method="email"` (the default) to log in with your email address instead.
 ## Usage
 Currently, the only features are fetching receipts and activating coupons
 ### Receipts
@@ -94,17 +108,14 @@ for receipt in lidl.tickets():
 
 ### Coupons
 
-You can list all coupons and activate/deactivate them by id
+You can list all coupons and activate/deactivate them by id.
+The coupons API now returns `sections` containing `promotions` with a `validity` range:
 ```json
 {
     "sections": [
         {
-            "name": "FavoriteStore",
-            "coupons": []
-        },
-        {
             "name": "AllStores",
-            "coupons": [
+            "promotions": [
                 {
                     "id": "2c9b3554-a09c-412c-8be4-d41cbff13572",
                     "image": "https://lidlplusprod.blob.core.windows.net/images/coupons/LT/IDISC0000254911.png?t=1695452076",
@@ -112,30 +123,18 @@ You can list all coupons and activate/deactivate them by id
                     "offerTitle": "1 + 1",
                     "title": "👨🏻‍🍳 Frozen 👨🏻‍🍳",
                     "offerDescriptionShort": "FREE",
-                    "isSegmented": false,
-                    "startValidityDate": "2023-09-24T21:00:00Z",
-                    "endValidityDate": "2023-10-01T20:59:59Z",
+                    "validity": {
+                        "start": "2023-09-24T21:00:00Z",
+                        "end": "2023-10-01T20:59:59Z"
+                    },
                     "isActivated": false,
-                    "apologizeText": "Xxxxxxxxxxxxxxxxx",
-                    "apologizeStatus": false,
-                    "apologizeTitle": "Xxxxxxxxxxxxxxxxxxx",
                     "promotionId": "DISC0000254911",
-                    "tagSpecial": "",
-                    "firstColor": "#ffc700",
-                    "secondaryColor": null,
-                    "firstFontColor": "#4a4a4a",
-                    "secondaryFontColor": null,
                     "isSpecial": false,
-                    "hasAsterisk": false,
                     "isHappyHour": false,
                     "stores": []
                 },
                 .......
             ]
-        },
-        {
-            "name": "OtherStores",
-            "coupons": []
         }
     ]
 }
@@ -155,7 +154,7 @@ from lidlplus import LidlPlusApi
 
 lidl = LidlPlusApi("de", "AT", refresh_token="XXXXXXXXXX")
 for section in lidl.coupons()["sections"]:
-  for coupon in section["coupons"]:
+  for coupon in section["promotions"]:
     print("found coupon: ", coupon["title"], coupon["id"])
 ```
 
@@ -171,6 +170,8 @@ options:
   -u USER, --user USER      Lidl Plus login username
   -p XXX, --password XXX    Lidl Plus login password
   --2fa {phone,email}       choose two factor auth method
+  -m {email,phone}, --method {email,phone}
+                            login with email address or phone number
   -r TOKEN, --refresh-token TOKEN
                             refresh token to authenticate
   --skip-verify             skip ssl verification

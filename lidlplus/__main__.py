@@ -42,16 +42,18 @@ def get_arguments():
         action="store_true",
     )
     parser.add_argument("-d", "--debug", help="debug mode", action="store_true")
-    subparser = parser.add_subparsers(title="commands", metavar="command", required=True)
-    auth = subparser.add_parser("auth", help="authenticate and get token")
-    auth.add_argument("auth", help="authenticate and print refresh_token", action="store_true")
-    loyalty_id = subparser.add_parser("id", help="show loyalty ID")
-    loyalty_id.add_argument("id", help="show loyalty ID", action="store_true")
+    parser.add_argument(
+        "-m",
+        "--method",
+        choices=["email", "phone"],
+        help="login with email address or phone number",
+    )
+    subparser = parser.add_subparsers(title="commands", metavar="command", dest="command", required=True)
+    subparser.add_parser("auth", help="authenticate and get token")
+    subparser.add_parser("id", help="show loyalty ID")
     receipt = subparser.add_parser("receipt", help="output last receipts as json")
-    receipt.add_argument("receipt", help="output last receipts as json", action="store_true")
     receipt.add_argument("-a", "--all", help="fetch all receipts", action="store_true")
     coupon = subparser.add_parser("coupon", help="activate coupons")
-    coupon.add_argument("coupon", help="output all coupons", action="store_true")
     coupon.add_argument("-a", "--all", help="activate all coupons", action="store_true")
     return vars(parser.parse_args())
 
@@ -84,7 +86,13 @@ def lidl_plus_login(args):
     country = args.get("country") or input("Enter your country (DE, AT, ...): ")
     if args.get("refresh_token"):
         return LidlPlusApi(language, country, args.get("refresh_token"))
-    username = args.get("user") or input("Enter your lidl plus username (phone number): ")
+    method = args.get("method")
+    while method not in ["email", "phone"]:
+        method = {"e": "email", "p": "phone"}.get(input("Login with [e]mail or [p]hone number?: ").strip().lower())
+    if method == "email":
+        username = args.get("user") or input("Enter your lidl plus email address: ")
+    else:
+        username = args.get("user") or input("Enter your lidl plus phone number (+4912345...): ")
     password = args.get("password") or getpass("Enter your lidl plus password: ")
     lidl_plus = LidlPlusApi(language, country)
     try:
@@ -92,6 +100,7 @@ def lidl_plus_login(args):
         lidl_plus.login(
             username,
             password,
+            method=method,
             verify_token_func=lambda: input(text),
             verify_mode=args["2fa"],
             headless=not args.get("debug"),
@@ -141,19 +150,6 @@ def activate_coupons(args):
         return
     i = 0
     for section in coupons.get("sections", {}):
-        for coupon in section.get("coupons", {}):
-            if coupon["isActivated"]:
-                continue
-            if datetime.fromisoformat(coupon["startValidityDate"]) > datetime.now(timezone.utc):
-                continue
-            if datetime.fromisoformat(coupon["endValidityDate"]) < datetime.now(timezone.utc):
-                continue
-            print("activating coupon: ", coupon["title"])
-            lidl_plus.activate_coupon(coupon["id"])
-            i += 1
-    # Some coupons are only available through V1 API
-    coupons = lidl_plus.coupon_promotions_v1()
-    for section in coupons.get("sections", {}):
         for coupon in section.get("promotions", {}):
             if coupon["isActivated"]:
                 continue
@@ -162,8 +158,8 @@ def activate_coupons(args):
                 continue
             if datetime.fromisoformat(validity["end"]) < datetime.now(timezone.utc):
                 continue
-            print("activating coupon v1: ", coupon["title"])
-            lidl_plus.activate_coupon_promotion_v1(coupon["promotionId"])
+            print("activating coupon: ", coupon["title"])
+            lidl_plus.activate_coupon(coupon["id"])
             i += 1
     print(f"Activated {i} coupons")
 
@@ -171,13 +167,13 @@ def activate_coupons(args):
 def main():
     """argument commands"""
     args = get_arguments()
-    if args.get("auth"):
+    if args.get("command") == "auth":
         print_refresh_token(args)
-    elif args.get("id"):
+    elif args.get("command") == "id":
         print_loyalty_id(args)
-    elif args.get("receipt"):
+    elif args.get("command") == "receipt":
         print_tickets(args)
-    elif args.get("coupon"):
+    elif args.get("command") == "coupon":
         activate_coupons(args)
 
 
