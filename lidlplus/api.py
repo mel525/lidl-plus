@@ -291,6 +291,18 @@ class LidlPlusApi:
                     continue
         return []
 
+    _ERROR_HINTS = {
+        "overcapacity": (
+            "Lidl's login service is temporarily refusing logins for this account or ip "
+            "(rate limiting or high load). Wait 30-60 minutes, then try again once."
+        ),
+        "locked": "The account seems to be locked. Reset your password via the Lidl app or website.",
+    }
+
+    def _add_error_hints(self, errors):
+        hints = [hint for needle, hint in self._ERROR_HINTS.items() if any(needle in e.lower() for e in errors)]
+        return errors + hints
+
     def _check_login_error(self, browser):
         try:
             response = browser.wait_for_request(f"{self._AUTH_API}/Account/Login.*", 10).response
@@ -299,10 +311,9 @@ class LidlPlusApi:
         if response is None:
             return
         body = html.unescape(decode(response.body, response.headers.get("Content-Encoding", "identity")).decode())
-        if errors := self._parse_app_errors(body):
-            raise LoginError(" / ".join(errors))
-        if errors := self._collect_page_errors(browser):
-            raise LoginError(" / ".join(errors))
+        errors = self._parse_app_errors(body) or self._collect_page_errors(browser)
+        if errors:
+            raise LoginError(" - ".join(self._add_error_hints(errors)))
 
     _MFA_SEND_BUTTONS = {
         "email": '#sso_2FAvalidation_emailbutton, [data-testid="forgot-password-by-email-button"]',
