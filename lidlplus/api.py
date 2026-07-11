@@ -6,6 +6,7 @@ import base64
 import html
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -31,7 +32,6 @@ try:
     from seleniumwire import webdriver
     from seleniumwire.utils import decode
     from webdriver_manager.chrome import ChromeDriverManager
-    from webdriver_manager.firefox import GeckoDriverManager
     from webdriver_manager.core.os_manager import ChromeType
 except ImportError as import_error:
     logging.debug("Auth dependencies not installed: %s", import_error)
@@ -92,6 +92,8 @@ class LidlPlusApi:
         options = webdriver.ChromeOptions()
         if headless:
             options.add_argument("headless")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("mobileEmulation", {"userAgent": user_agent})
         for chrome_type in [ChromeType.GOOGLE, ChromeType.MSEDGE, ChromeType.CHROMIUM]:
             try:
@@ -157,8 +159,14 @@ class LidlPlusApi:
         return f"{self._register_oauth_client()}&{params}"
 
     @staticmethod
-    def _accept_legal_terms(browser, wait, accept=True):
-        wait.until(expected_conditions.visibility_of_element_located((By.ID, "checkbox_Accepted"))).click()
+    def _accept_legal_terms(browser, accept=True):
+        try:
+            checkbox = WebDriverWait(browser, 5).until(
+                expected_conditions.visibility_of_element_located((By.ID, "checkbox_Accepted"))
+            )
+        except TimeoutException:
+            return
+        checkbox.click()
         if not accept:
             title = browser.find_element(By.TAG_NAME, "h2").text
             raise LegalTermsException(title)
@@ -176,7 +184,18 @@ class LidlPlusApi:
             return code[0]
         return ""
 
-    def _parse_code(self, browser, wait, accept_legal_terms=True):
+    @staticmethod
+    def _collect_page_errors(browser):
+        """Grab any visible error messages from the login page for better error reporting"""
+        errors = []
+        selectors = ['[id$="-error"]', ".input-error-message", '[class*="error-message"]']
+        for selector in selectors:
+            for element in browser.find_elements(By.CSS_SELECTOR, selector):
+                if text := element.text.strip():
+                    errors.append(text)
+        return errors
+
+    def _parse_code_once(self, browser, accept_legal_terms=True):
         candidate_urls = [browser.current_url]
         for request in reversed(browser.requests):
             candidate_urls.append(request.url)
@@ -184,51 +203,68 @@ class LidlPlusApi:
                 candidate_urls.append(request.response.headers.get("Location") or "")
 
         for candidate_url in candidate_urls:
-            if "legalTerms" in candidate_url:
-                self._accept_legal_terms(browser, wait, accept=accept_legal_terms)
-                return self._parse_code(browser, wait, False)
             if code := self._extract_code_from_url(candidate_url):
                 return code
-        raise LoginError("Unable to parse authorization code from login redirect")
+        for candidate_url in candidate_urls:
+            if "legalTerms" in candidate_url:
+                self._accept_legal_terms(browser, accept=accept_legal_terms)
+                del browser.requests
+                break
+        return ""
 
-    def _click(self, browser, button, request=""):
-        del browser.requests
-        browser.backend.storage.clear_requests()
-        browser.find_element(*button).click()
-        self._check_input_error(browser)
-        if request and browser.wait_for_request(request, 10):
-            self._check_input_error(browser)
-
-    @staticmethod
-    def _check_input_error(browser):
-        if errors := browser.find_elements(By.CLASS_NAME, "input-error-message"):
-            for error in errors:
-                if error.text:
-                    raise LoginError(error.text)
+    def _parse_code(self, browser, accept_legal_terms=True, timeout=15):
+        """Poll for the authorization code, the redirect can take a moment after login"""
+        deadline = time.monotonic() + timeout
+        while True:
+            if code := self._parse_code_once(browser, accept_legal_terms):
+                return code
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(1)
+        message = "Unable to parse authorization code from login redirect"
+        if errors := self._collect_page_errors(browser):
+            message += f" - the login page reports: {' / '.join(errors)}"
+        else:
+            current = urlparse(browser.current_url)
+            message += f" - login never reached the callback (stuck on {current.netloc}{current.path})"
+        raise LoginError(message)
 
     def _check_login_error(self, browser):
-        response = browser.wait_for_request(f"{self._AUTH_API}/Account/Login.*", 10).response
+        try:
+            response = browser.wait_for_request(f"{self._AUTH_API}/Account/Login.*", 10).response
+        except TimeoutException:
+            return
         if response is None:
             return
         body = html.unescape(decode(response.body, response.headers.get("Content-Encoding", "identity")).decode())
         if error := re.findall('app-errors="\\{[^:]*?:.(.*?).}', body):
             raise LoginError(error[0])
+        if errors := self._collect_page_errors(browser):
+            raise LoginError(" / ".join(errors))
 
-    def _check_2fa_auth(self, browser, wait, verify_mode="phone", verify_token_func=None):
+    def _check_2fa_auth(self, browser, verify_mode="phone", verify_token_func=None):
+        """
+        Lidl asks for a one time verification code when it does not know the device.
+        Wait a moment for the code input to appear - if it does not, no code is needed.
+        """
         if verify_mode not in ["phone", "email"]:
             raise ValueError(f'Unknown 2fa-mode "{verify_mode}" - Only "phone" or "email" supported')
         try:
-            element = WebDriverWait(browser, 5).until(
-                expected_conditions.visibility_of_element_located((By.CLASS_NAME, verify_mode))
+            code_input = WebDriverWait(browser, 8).until(
+                expected_conditions.visibility_of_element_located(
+                    (
+                        By.CSS_SELECTOR,
+                        '[data-testid="input-verification-code"], input[autocomplete="one-time-code"]',
+                    )
+                )
             )
         except TimeoutException:
             return
-        element.find_element(By.TAG_NAME, "button").click()
         if verify_token_func is None:
-            raise LoginError("Two factor authentication required but no verify_token_func provided")
+            raise LoginError("A verification code is required but no verify_token_func was provided")
         verify_code = verify_token_func()
-        browser.find_element(By.NAME, "VerificationCode").send_keys(verify_code)
-        self._click(browser, (By.CLASS_NAME, "role_next"))
+        code_input.send_keys(verify_code)
+        self._submit_form_step(browser, fallback_field=code_input)
 
     @staticmethod
     def _accept_cookies(browser):
@@ -241,11 +277,12 @@ class LidlPlusApi:
             pass
 
     @staticmethod
-    def _submit_password(browser, password_field):
-        """Click the password submit button, falling back to pressing enter in the password field"""
+    def _submit_form_step(browser, fallback_field=None):
+        """Click the primary submit button of the current login step"""
         locators = [
+            (By.CSS_SELECTOR, '#duple-button-block button[type="submit"]'),
+            (By.CSS_SELECTOR, 'button[data-testid="button-primary"]'),
             (By.XPATH, "/html/body/main/form[1]/div/div/div/div/section/button"),
-            (By.CSS_SELECTOR, 'section[data-testid$="step-view"] button:last-of-type'),
         ]
         for locator in locators:
             try:
@@ -253,7 +290,9 @@ class LidlPlusApi:
                 return
             except TimeoutException:
                 continue
-        password_field.send_keys(Keys.RETURN)
+        if fallback_field is None:
+            raise LoginError("Unable to find the submit button of the login form")
+        fallback_field.send_keys(Keys.RETURN)
 
     def login(self, username, password, method="email", **kwargs):
         """
@@ -281,16 +320,21 @@ class LidlPlusApi:
         ).click()
         password_field = wait.until(expected_conditions.element_to_be_clickable((By.NAME, "Password")))
         password_field.send_keys(password)
-        self._submit_password(browser, password_field)
+        # drop requests captured so far, otherwise the waits below match
+        # the initial page load requests instead of the login submission
+        del browser.requests
+        self._submit_form_step(browser, fallback_field=password_field)
         self._check_login_error(browser)
         self._check_2fa_auth(
             browser,
-            wait,
             kwargs.get("verify_mode", "phone"),
             kwargs.get("verify_token_func"),
         )
-        browser.wait_for_request(f"{self._AUTH_API}/connect.*")
-        code = self._parse_code(browser, wait, accept_legal_terms=kwargs.get("accept_legal_terms", True))
+        try:
+            browser.wait_for_request(f"{self._AUTH_API}/connect/authorize/callback", 30)
+        except TimeoutException:
+            pass  # _parse_code polls and reports what went wrong
+        code = self._parse_code(browser, accept_legal_terms=kwargs.get("accept_legal_terms", True))
         self._authorization_code(code)
         browser.quit()
 

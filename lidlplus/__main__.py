@@ -2,6 +2,7 @@
 """
 lidl plus command line tool
 """
+
 import argparse
 import json
 import os
