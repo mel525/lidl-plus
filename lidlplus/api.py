@@ -88,15 +88,19 @@ class LidlPlusApi:
         self._login_url = auth_req.request(client.authorization_endpoint)
         return self._login_url
 
-    def _init_chrome(self, headless=True):
-        user_agent = UserAgent(self._OS.lower()).Random()
+    def _init_chrome(self, headless=True, spoof_user_agent=True):
         logging.getLogger("WDM").setLevel(logging.NOTSET)
         options = webdriver.ChromeOptions()
         if headless:
             options.add_argument("headless")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option("mobileEmulation", {"userAgent": user_agent})
+        # A spoofed mobile user agent on a desktop Chrome engine is an obvious bot
+        # signal to reCAPTCHA. Only spoof it for the headless automated login; a
+        # visible manual login scores far better with Chrome's own user agent.
+        if spoof_user_agent:
+            user_agent = UserAgent(self._OS.lower()).Random()
+            options.add_experimental_option("mobileEmulation", {"userAgent": user_agent})
         for chrome_type in [ChromeType.GOOGLE, ChromeType.MSEDGE, ChromeType.CHROMIUM]:
             try:
                 service = Service(ChromeDriverManager(chrome_type=chrome_type).install())
@@ -105,22 +109,23 @@ class LidlPlusApi:
                 continue
         raise WebBrowserException("Unable to find a suitable Chrome driver")
 
-    def _init_firefox(self, headless=True):
-        user_agent = UserAgent(self._OS.lower()).Random()
+    def _init_firefox(self, headless=True, spoof_user_agent=True):
         logging.getLogger("WDM").setLevel(logging.NOTSET)
         options = webdriver.FirefoxOptions()
         if headless:
             options.add_argument("-headless")
-        options.set_preference("general.useragent.override", user_agent)
+        if spoof_user_agent:
+            user_agent = UserAgent(self._OS.lower()).Random()
+            options.set_preference("general.useragent.override", user_agent)
         return webdriver.Firefox(options=options)
 
-    def _get_browser(self, headless=True):
+    def _get_browser(self, headless=True, spoof_user_agent=True):
         try:
-            return self._init_chrome(headless=headless)
+            return self._init_chrome(headless=headless, spoof_user_agent=spoof_user_agent)
         # pylint: disable=broad-except
         except Exception as exc1:
             try:
-                return self._init_firefox(headless=headless)
+                return self._init_firefox(headless=headless, spoof_user_agent=spoof_user_agent)
             except Exception as exc2:
                 raise WebBrowserException from exc1 and exc2
 
@@ -426,6 +431,31 @@ class LidlPlusApi:
         code = self._parse_code(browser, accept_legal_terms=kwargs.get("accept_legal_terms", True))
         self._authorization_code(code)
         browser.quit()
+
+    def open_login(self, timeout=300, accept_legal_terms=True):
+        """
+        Open a visible browser and let the user log in by hand - typing the
+        password, solving the reCAPTCHA and entering the one time code Lidl sends.
+        Once Lidl redirects back to the app callback, the authorization code is
+        captured and exchanged for a token.
+
+        This sidesteps the bot detection that blocks the automated headless login:
+        a real person in a real browser window passes Lidl's reCAPTCHA score check.
+
+        :param timeout: seconds to wait for the user to finish the login
+        :param accept_legal_terms: auto-accept updated legal terms if Lidl shows them
+        """
+        browser = self._get_browser(headless=False, spoof_user_agent=False)
+        try:
+            browser.get(self._register_link)
+            code = self._parse_code(browser, accept_legal_terms=accept_legal_terms, timeout=timeout)
+            self._authorization_code(code)
+        finally:
+            # pylint: disable=broad-except
+            try:
+                browser.quit()
+            except Exception as error:
+                logging.debug("Could not close browser: %s", error)
 
     def _default_headers(self):
         token_expired = self._expires and datetime.now(timezone.utc) >= self._expires

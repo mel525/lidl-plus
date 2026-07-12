@@ -44,6 +44,11 @@ def get_arguments():
     )
     parser.add_argument("-d", "--debug", help="debug mode", action="store_true")
     parser.add_argument(
+        "--manual",
+        help="open a browser and log in by hand (recommended - avoids bot detection)",
+        action="store_true",
+    )
+    parser.add_argument(
         "-m",
         "--method",
         choices=["email", "phone"],
@@ -76,6 +81,30 @@ def check_auth():
         sys.exit(1)
 
 
+def _manual_login(args, language, country):
+    """open a browser and let the user perform the login by hand"""
+    lidl_plus = LidlPlusApi(language, country)
+    print(
+        "Opening a browser window. Log in to Lidl Plus there:\n"
+        "  1. enter your email/phone and password\n"
+        "  2. request and type the verification code Lidl sends you\n"
+        "The tool waits until Lidl signs you in, then continues automatically.\n"
+        "Don't close the window - it closes on its own once login succeeds.\n"
+    )
+    try:
+        lidl_plus.open_login(accept_legal_terms=not args.get("not_accept_legal_terms"))
+    except WebBrowserException:
+        print("Can't connect to web browser. Please install Chrome, Chromium or Firefox")
+        sys.exit(101)
+    except LoginError as error:
+        print(f"Login failed - {error}")
+        sys.exit(102)
+    except LegalTermsException as error:
+        print(f"Legal terms not accepted - {error}")
+        sys.exit(103)
+    return lidl_plus
+
+
 def lidl_plus_login(args):
     """handle authentication"""
     if not args.get("refresh_token"):
@@ -87,6 +116,8 @@ def lidl_plus_login(args):
     country = args.get("country") or input("Enter your country (DE, AT, ...): ")
     if args.get("refresh_token"):
         return LidlPlusApi(language, country, args.get("refresh_token"))
+    if args.get("manual"):
+        return _manual_login(args, language, country)
     method = args.get("method")
     while method not in ["email", "phone"]:
         method = {"e": "email", "p": "phone"}.get(input("Login with [e]mail or [p]hone number?: ").strip().lower())
