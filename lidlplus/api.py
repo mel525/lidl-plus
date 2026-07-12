@@ -31,6 +31,7 @@ try:
     from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support import expected_conditions
     from selenium.webdriver.support.ui import WebDriverWait
+    from selenium import webdriver as selenium_webdriver
     from seleniumwire import webdriver
     from seleniumwire.utils import decode
     from webdriver_manager.chrome import ChromeDriverManager
@@ -432,6 +433,76 @@ class LidlPlusApi:
         self._authorization_code(code)
         browser.quit()
 
+    def _init_plain_chrome(self):
+        """
+        A plain Selenium Chrome without selenium-wire's intercepting proxy.
+
+        selenium-wire re-does every TLS handshake in Python, so the connection's
+        fingerprint is not Chrome's and reCAPTCHA Enterprise scores it as a bot
+        (Lidl then rejects the login as "capacity exceeded"). Plain Chrome keeps
+        its real TLS fingerprint; the authorization code is read from Chrome's
+        performance log instead of from intercepted requests.
+        """
+        logging.getLogger("WDM").setLevel(logging.NOTSET)
+        options = selenium_webdriver.ChromeOptions()
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+        for chrome_type in [ChromeType.GOOGLE, ChromeType.MSEDGE, ChromeType.CHROMIUM]:
+            try:
+                service = Service(ChromeDriverManager(chrome_type=chrome_type).install())
+                return selenium_webdriver.Chrome(service=service, options=options)
+            except AttributeError:
+                continue
+        raise WebBrowserException("Unable to find a suitable Chrome driver")
+
+    @staticmethod
+    def _cdp_candidate_urls(browser):
+        """Pull every url and redirect Location out of Chrome's performance log"""
+        urls = [browser.current_url]
+        # pylint: disable=broad-except
+        try:
+            entries = browser.get_log("performance")
+        except Exception as error:
+            logging.debug("Could not read performance log: %s", error)
+            return urls
+        for entry in entries:
+            try:
+                message = json.loads(entry["message"])["message"]
+            except (KeyError, ValueError):
+                continue
+            params = message.get("params", {})
+            urls.append((params.get("request") or {}).get("url", ""))
+            urls.append(params.get("documentURL", ""))
+            for response in (params.get("redirectResponse"), params.get("response")):
+                if not response:
+                    continue
+                urls.append(response.get("url", ""))
+                for key, value in (response.get("headers") or {}).items():
+                    if key.lower() == "location":
+                        urls.append(value)
+            for key, value in (params.get("headers") or {}).items():
+                if key.lower() == "location":
+                    urls.append(value)
+        return urls
+
+    def _parse_code_cdp(self, browser, accept_legal_terms=True, timeout=300):
+        """Poll Chrome's performance log for the authorization code while the user logs in"""
+        deadline = time.monotonic() + timeout
+        while True:
+            for candidate_url in self._cdp_candidate_urls(browser):
+                if code := self._extract_code_from_url(candidate_url):
+                    return code
+            if accept_legal_terms and "legalTerms" in browser.current_url:
+                self._accept_legal_terms(browser, accept=accept_legal_terms)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(1)
+        message = "Timed out waiting for the manual login to complete"
+        if errors := self._collect_page_errors(browser):
+            message += f" - the login page reports: {' / '.join(errors)}"
+        raise LoginError(message)
+
     def open_login(self, timeout=300, accept_legal_terms=True):
         """
         Open a visible browser and let the user log in by hand - typing the
@@ -440,15 +511,16 @@ class LidlPlusApi:
         captured and exchanged for a token.
 
         This sidesteps the bot detection that blocks the automated headless login:
-        a real person in a real browser window passes Lidl's reCAPTCHA score check.
+        a real person in a real Chrome (with its real TLS fingerprint) passes
+        Lidl's reCAPTCHA score check.
 
         :param timeout: seconds to wait for the user to finish the login
         :param accept_legal_terms: auto-accept updated legal terms if Lidl shows them
         """
-        browser = self._get_browser(headless=False, spoof_user_agent=False)
+        browser = self._init_plain_chrome()
         try:
             browser.get(self._register_link)
-            code = self._parse_code(browser, accept_legal_terms=accept_legal_terms, timeout=timeout)
+            code = self._parse_code_cdp(browser, accept_legal_terms=accept_legal_terms, timeout=timeout)
             self._authorization_code(code)
         finally:
             # pylint: disable=broad-except
